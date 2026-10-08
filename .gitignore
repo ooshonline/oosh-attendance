@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+# Local-only notes and old backups
+dev-log.md
+index.fixed-remove-bug-*.html
+*.csv
