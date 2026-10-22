@@ -1323,25 +1323,32 @@ async function _weeklyBackup(){
   if(!CLOUD.on||!CLOUD.db||CLOUD.err)return;
   try{
     const col=CLOUD.db.collection('backups'),id=_weekId(new Date());
-    const qs=await col.get();const ids=[];qs.forEach(doc=>ids.push(doc.id));
+    const qs=await col.get({source:'server'});const ids=[];qs.forEach(doc=>ids.push(doc.id));
     if(!ids.includes(id)){
+      // Read straight from the server so the backup is the cloud's real copy.
+      const db=CLOUD.db,srv={source:'server'};
+      const [r,a,se]=await Promise.all([db.collection('meta').doc('roster').get(srv),db.collection('attendance').get(srv),db.collection('meta').doc('seasonal').get(srv)]);
+      const data={students:(r.exists&&r.data().students)||[],attendance:{}};
+      a.forEach(doc=>{data.attendance[doc.id]=doc.data().records||[];});
+      const seasonal=(se.exists&&se.data().data)||{days:{}};
       const u=CLOUD.auth&&CLOUD.auth.currentUser;
-      const packed=await _pack({app:'oosh-attendance',v:2,exportedAt:new Date().toISOString(),data:_clone(_state),seasonal:_clone(_seasStateSafe())});
-      await col.doc(id).set(Object.assign({at:new Date().toISOString(),by:(u&&u.email)||null,students:(_state.students||[]).length,days:Object.keys(_state.attendance||{}).length},packed));
+      const packed=await _pack({app:'oosh-attendance',v:2,exportedAt:new Date().toISOString(),data,seasonal});
+      await col.doc(id).set(Object.assign({at:new Date().toISOString(),by:(u&&u.email)||null,students:data.students.length,days:Object.keys(data.attendance).length},packed));
       ids.push(id);
     }
     ids.sort().reverse().slice(BACKUP_KEEP).forEach(old=>col.doc(old).delete().catch(()=>{}));
-  }catch(e){console.warn('weekly backup',e);}
+  }catch(e){console.warn('weekly backup',e);return e.message||String(e);}
 }
 async function _showBackups(){
   const box=document.getElementById('weeklyList');if(!box)return;
   if(!CLOUD.on||!CLOUD.db){box.textContent='Sign in to see weekly cloud backups.';return;}
   box.textContent='Loading…';
   try{
+    const failed=await _weeklyBackup();
     const qs=await CLOUD.db.collection('backups').get(),rows=[];
     qs.forEach(doc=>rows.push(Object.assign({id:doc.id},doc.data())));
     rows.sort((a,b)=>a.id<b.id?1:-1);
-    if(!rows.length){box.textContent='No weekly backups yet — the first is made automatically after you sign in.';return;}
+    if(!rows.length){box.textContent='No weekly backups yet, and this week\'s could not be made: '+(failed||'unknown error')+'. Try again in a minute.';return;}
     box.innerHTML='';
     rows.forEach(r=>{
       const b=document.createElement('button');b.className='menu-row';
@@ -1369,7 +1376,7 @@ function cloudStart(){
   });
   _listen('attendance',db.collection('attendance'),qs=>{
     const server={};qs.forEach(doc=>{server[doc.id]=doc.data().records||[];});
-    if(!(qs.metadata&&qs.metadata.fromCache)&&!CLOUD.backupTimer)CLOUD.backupTimer=setTimeout(()=>{_weeklyBackup();setInterval(_weeklyBackup,6*36e5);},15000);
+    if(!CLOUD.backupTimer)CLOUD.backupTimer=setTimeout(()=>{_weeklyBackup();setInterval(_weeklyBackup,6*36e5);},15000);
     const local=_state.attendance||{},merged=_clone(server);
     let lost=false,keep=false;
     Object.keys(_dirty.dates).forEach(ds=>{
