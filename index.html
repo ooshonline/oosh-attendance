@@ -773,6 +773,8 @@ body.local-only #cloudBtn{opacity:.55;}
       <button class="menu-row" id="restoreBtn" style="flex:1;margin-top:8px">♻️ Restore</button>
     </div>
     <button class="menu-row" id="prevCopyBtn">🕘 Load copy saved before last cloud update</button>
+    <button class="menu-row" id="weeklyBtn">📦 Weekly cloud backups (last 8 weeks)</button>
+    <div id="weeklyList" class="cloud-user" style="text-align:left"></div>
     <hr>
     <button class="menu-row danger" id="logoutBtn">Log out</button>
     <button class="menu-row" id="cloudClose" style="margin-top:8px">Close</button>
@@ -1296,6 +1298,63 @@ function _listen(name,ref,onData){
     setTimeout(()=>{if(CLOUD.on)_listen(name,ref,onData);},30000);
   });
 }
+// ── Weekly cloud backup. The first signed-in device each week saves a full,
+//    gzipped copy to backups/{YYYY-Www}; only the newest BACKUP_KEEP are kept. ──
+const BACKUP_KEEP=8;
+function _weekId(d){
+  const t=new Date(Date.UTC(d.getFullYear(),d.getMonth(),d.getDate()));
+  const day=t.getUTCDay()||7;t.setUTCDate(t.getUTCDate()+4-day);
+  const y=t.getUTCFullYear(),w=Math.ceil(((t-Date.UTC(y,0,1))/864e5+1)/7);
+  return y+'-W'+String(w).padStart(2,'0');
+}
+async function _pack(obj){
+  const json=JSON.stringify(obj);
+  if(typeof CompressionStream==='undefined')return{enc:'json',body:json};
+  const buf=new Uint8Array(await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+  let bin='';for(let i=0;i<buf.length;i+=32768)bin+=String.fromCharCode.apply(null,buf.subarray(i,i+32768));
+  return{enc:'gzip-b64',body:btoa(bin)};
+}
+async function _unpack(doc){
+  if(doc.enc==='json')return JSON.parse(doc.body);
+  const bin=atob(doc.body),buf=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i);
+  return JSON.parse(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+}
+async function _weeklyBackup(){
+  if(!CLOUD.on||!CLOUD.db||CLOUD.err)return;
+  try{
+    const col=CLOUD.db.collection('backups'),id=_weekId(new Date());
+    const qs=await col.get();const ids=[];qs.forEach(doc=>ids.push(doc.id));
+    if(!ids.includes(id)){
+      const u=CLOUD.auth&&CLOUD.auth.currentUser;
+      const packed=await _pack({app:'oosh-attendance',v:2,exportedAt:new Date().toISOString(),data:_clone(_state),seasonal:_clone(_seasStateSafe())});
+      await col.doc(id).set(Object.assign({at:new Date().toISOString(),by:(u&&u.email)||null,students:(_state.students||[]).length,days:Object.keys(_state.attendance||{}).length},packed));
+      ids.push(id);
+    }
+    ids.sort().reverse().slice(BACKUP_KEEP).forEach(old=>col.doc(old).delete().catch(()=>{}));
+  }catch(e){console.warn('weekly backup',e);}
+}
+async function _showBackups(){
+  const box=document.getElementById('weeklyList');if(!box)return;
+  if(!CLOUD.on||!CLOUD.db){box.textContent='Sign in to see weekly cloud backups.';return;}
+  box.textContent='Loading…';
+  try{
+    const qs=await CLOUD.db.collection('backups').get(),rows=[];
+    qs.forEach(doc=>rows.push(Object.assign({id:doc.id},doc.data())));
+    rows.sort((a,b)=>a.id<b.id?1:-1);
+    if(!rows.length){box.textContent='No weekly backups yet — the first is made automatically after you sign in.';return;}
+    box.innerHTML='';
+    rows.forEach(r=>{
+      const b=document.createElement('button');b.className='menu-row';
+      b.textContent='📦 '+new Date(r.at).toLocaleString()+' — '+r.students+' students, '+r.days+' days';
+      b.addEventListener('click',async()=>{
+        try{const obj=await _unpack(r);document.getElementById('backupBox').value=JSON.stringify(obj);
+          alert('Loaded the weekly backup from '+new Date(r.at).toLocaleString()+' into the box. Press Restore only if you want it to replace the current data.');}
+        catch(e){alert('Could not open that backup: '+e.message);}
+      });
+      box.appendChild(b);
+    });
+  }catch(e){box.textContent='Could not load backups: '+e.message;}
+}
 function cloudStart(){
   const db=CLOUD.db;
   _listen('roster',db.collection('meta').doc('roster'),snap=>{
@@ -1310,6 +1369,7 @@ function cloudStart(){
   });
   _listen('attendance',db.collection('attendance'),qs=>{
     const server={};qs.forEach(doc=>{server[doc.id]=doc.data().records||[];});
+    if(!(qs.metadata&&qs.metadata.fromCache)&&!CLOUD.backupTimer)CLOUD.backupTimer=setTimeout(()=>{_weeklyBackup();setInterval(_weeklyBackup,6*36e5);},15000);
     const local=_state.attendance||{},merged=_clone(server);
     let lost=false,keep=false;
     Object.keys(_dirty.dates).forEach(ds=>{
@@ -1428,6 +1488,7 @@ document.getElementById('copyBackupBtn').addEventListener('click',()=>{
   if(navigator.clipboard)navigator.clipboard.writeText(box.value).then(()=>_toast('Backup copied')).catch(()=>{try{document.execCommand('copy');_toast('Backup copied');}catch(e){}});
   else{try{document.execCommand('copy');_toast('Backup copied');}catch(e){}}
 });
+document.getElementById('weeklyBtn').addEventListener('click',_showBackups);
 document.getElementById('prevCopyBtn').addEventListener('click',()=>{
   const list=_readLocal(PREV_STORE,[]);
   if(!list.length){alert('No earlier copy has been saved on this device.');return;}
