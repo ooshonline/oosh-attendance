@@ -726,10 +726,16 @@ body.seasonal-mode .summary-table th.col-today, body.seasonal-mode .summary-tabl
 .sync-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#27ae72;margin-right:5px;vertical-align:middle;}
 .sync-dot.offline{background:#e07b00;}
 .sync-dot.local{background:#9aacb4;}
+.sync-dot.error{background:#e53935;}
+.cloud-status.error{background:#fdecea;color:#c62828;}
+.sync-banner{display:none;position:sticky;top:0;z-index:300;background:#e53935;color:#fff;font-weight:700;font-size:.88rem;padding:10px 14px;text-align:center;cursor:pointer;line-height:1.35;}
+.sync-banner.offline{background:#e07b00;}
 body.local-only #cloudBtn{opacity:.55;}
 </style>
 </head>
 <body>
+
+<div id="syncBanner" class="sync-banner" role="alert"></div>
 
 <!-- ══ HEADER ══ -->
 <header>
@@ -766,6 +772,7 @@ body.local-only #cloudBtn{opacity:.55;}
       <button class="menu-row" id="copyBackupBtn" style="flex:1;margin-top:8px">📋 Copy</button>
       <button class="menu-row" id="restoreBtn" style="flex:1;margin-top:8px">♻️ Restore</button>
     </div>
+    <button class="menu-row" id="prevCopyBtn">🕘 Load copy saved before last cloud update</button>
     <hr>
     <button class="menu-row danger" id="logoutBtn">Log out</button>
     <button class="menu-row" id="cloudClose" style="margin-top:8px">Close</button>
@@ -1195,7 +1202,36 @@ let _state=_readLocal(STORE,{students:[],attendance:{}});
 if(!_state.students)_state.students=[];
 if(!_state.attendance)_state.attendance={};
 function load(){return _clone(_state);}
-function save(d){_state=_clone(d);localStorage.setItem(STORE,JSON.stringify(_state));syncPush(_state);}
+function save(d){const prev=_state;_state=_clone(d);_markDirty(prev,_state);localStorage.setItem(STORE,JSON.stringify(_state));syncPush(_state);}
+
+// ── Unsynced changes. Every day (and the roster / seasonal data) changed on this
+//    device stays "dirty" until the cloud confirms it. An incoming cloud snapshot
+//    never overwrites a dirty day; the local version is pushed up instead. ──
+const DIRTY_STORE='oosh_dirty_v1';
+let _dirty=_readLocal(DIRTY_STORE,{});
+if(!_dirty.dates)_dirty.dates={};
+function _saveDirty(){try{localStorage.setItem(DIRTY_STORE,JSON.stringify(_dirty));}catch(e){}_updateBanner();}
+function _recs(v){return v&&v.length?v:[];}
+function _sameDay(a,b){return JSON.stringify(_recs(a))===JSON.stringify(_recs(b));}
+function _markDirty(a,b){
+  if(JSON.stringify(a.students||[])!==JSON.stringify(b.students||[]))_dirty.roster=true;
+  const x=a.attendance||{},y=b.attendance||{};
+  new Set([...Object.keys(x),...Object.keys(y)]).forEach(ds=>{if(!_sameDay(x[ds],y[ds]))_dirty.dates[ds]=true;});
+  _saveDirty();
+}
+function _dirtyCount(){return Object.keys(_dirty.dates).length+(_dirty.roster?1:0)+(_dirty.seasonal?1:0);}
+
+// ── Before the cloud replaces anything that had records on this device, keep the
+//    old local copy (last 3) so it can be restored from Sync & Data. ──
+const PREV_STORE='oosh_v2_prev';
+function _stashLocal(why){
+  try{
+    const list=_readLocal(PREV_STORE,[]);
+    list.unshift({at:new Date().toISOString(),why,data:_clone(_state),seasonal:_clone(_seasStateSafe())});
+    localStorage.setItem(PREV_STORE,JSON.stringify(list.slice(0,3)));
+  }catch(e){console.warn('stash',e);}
+}
+function _seasStateSafe(){return typeof _seasState!=='undefined'?_seasState:{days:{}};}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,6);}
 
 // ══════════════ Cloud sync (Firebase) ══════════════
@@ -1220,15 +1256,19 @@ function syncPush(d){
   const db=CLOUD.db,prev=CLOUD.synced;
   try{
     if(JSON.stringify(d.students||[])!==JSON.stringify(prev.students||[])){
-      db.collection('meta').doc('roster').set({students:d.students||[]});
+      const sent=JSON.stringify(d.students||[]);
+      db.collection('meta').doc('roster').set({students:d.students||[]})
+        .then(()=>{if(JSON.stringify(_state.students||[])===sent){delete _dirty.roster;_saveDirty();}})
+        .catch(_writeFailed);
     }
     const cur=d.attendance||{},old=prev.attendance||{};
     const dates=new Set([...Object.keys(cur),...Object.keys(old)]);
     dates.forEach(ds=>{
-      if(JSON.stringify(cur[ds])!==JSON.stringify(old[ds])){
-        if(cur[ds]&&cur[ds].length)db.collection('attendance').doc(ds).set({records:cur[ds]});
-        else db.collection('attendance').doc(ds).delete().catch(()=>{});
-      }
+      if(_sameDay(cur[ds],old[ds]))return;
+      const sent=_recs(cur[ds]);
+      const done=()=>{if(_sameDay(_state.attendance[ds],sent)){delete _dirty.dates[ds];_saveDirty();}};
+      if(sent.length)db.collection('attendance').doc(ds).set({records:sent}).then(done).catch(_writeFailed);
+      else db.collection('attendance').doc(ds).delete().then(done).catch(_writeFailed);
     });
     CLOUD.synced=_clone(d);
   }catch(e){console.warn('syncPush',e);}
@@ -1237,40 +1277,94 @@ function syncPushSeasonal(sd){
   if(!CLOUD.on||!CLOUD.db)return;
   try{
     if(JSON.stringify(sd)!==JSON.stringify(CLOUD.seasSynced)){
-      CLOUD.db.collection('meta').doc('seasonal').set({data:sd});
+      const sent=JSON.stringify(sd);
+      CLOUD.db.collection('meta').doc('seasonal').set({data:sd})
+        .then(()=>{if(JSON.stringify(_seasState)===sent){delete _dirty.seasonal;_saveDirty();}})
+        .catch(_writeFailed);
       CLOUD.seasSynced=_clone(sd);
     }
   }catch(e){console.warn('syncPushSeasonal',e);}
 }
+function _writeFailed(e){console.warn('cloud write failed',e);CLOUD.err=true;_refreshSync();}
 
-// Live inbound listeners — rebuild state from server and re-render.
+// Live inbound listeners — rebuild state from server and re-render. Days with
+// unsynced local changes keep the local version and are pushed back up. A failed
+// listener is retried every 30 s instead of silently stopping.
+function _listen(name,ref,onData){
+  ref.onSnapshot(s=>{if(CLOUD.err){CLOUD.err=false;_refreshSync();}onData(s);},e=>{
+    console.warn(name+' listen',e);CLOUD.err=true;_refreshSync();
+    setTimeout(()=>{if(CLOUD.on)_listen(name,ref,onData);},30000);
+  });
+}
 function cloudStart(){
   const db=CLOUD.db;
-  db.collection('meta').doc('roster').onSnapshot(snap=>{
-    const students=(snap.exists&&snap.data().students)||[];
-    _state.students=students;CLOUD.synced.students=_clone(students);
+  _listen('roster',db.collection('meta').doc('roster'),snap=>{
+    const server=(snap.exists&&snap.data().students)||[];
+    CLOUD.synced.students=_clone(server);
+    if(_dirty.roster){
+      if(JSON.stringify(server)===JSON.stringify(_state.students||[])){delete _dirty.roster;_saveDirty();}
+      else{syncPush(_state);return;}
+    }
+    _state.students=server;
     localStorage.setItem(STORE,JSON.stringify(_state));_rerender();
-  },e=>console.warn('roster listen',e));
-  db.collection('attendance').onSnapshot(qs=>{
-    const att={};qs.forEach(doc=>{att[doc.id]=doc.data().records||[];});
-    _state.attendance=att;CLOUD.synced.attendance=_clone(att);
-    localStorage.setItem(STORE,JSON.stringify(_state));_rerender();
-  },e=>console.warn('att listen',e));
-  db.collection('meta').doc('seasonal').onSnapshot(snap=>{
+  });
+  _listen('attendance',db.collection('attendance'),qs=>{
+    const server={};qs.forEach(doc=>{server[doc.id]=doc.data().records||[];});
+    const local=_state.attendance||{},merged=_clone(server);
+    let lost=false,keep=false;
+    Object.keys(_dirty.dates).forEach(ds=>{
+      if(_sameDay(local[ds],server[ds])){delete _dirty.dates[ds];return;}
+      // Never let an empty local day wipe a day the cloud has records for.
+      if(!_recs(local[ds]).length&&_recs(server[ds]).length){delete _dirty.dates[ds];return;}
+      keep=true;
+      if(_recs(local[ds]).length)merged[ds]=_clone(local[ds]);else delete merged[ds];
+    });
+    Object.keys(local).forEach(ds=>{if(_recs(local[ds]).length&&!_dirty.dates[ds]&&!_sameDay(local[ds],merged[ds]))lost=true;});
+    if(lost)_stashLocal('cloud update replaced local days');
+    _saveDirty();
+    CLOUD.synced.attendance=_clone(server);
+    _state.attendance=merged;
+    localStorage.setItem(STORE,JSON.stringify(_state));
+    if(keep)syncPush(_state);
+    _rerender();
+  });
+  _listen('seasonal',db.collection('meta').doc('seasonal'),snap=>{
     const sd=(snap.exists&&snap.data().data)||{days:{}};
-    _seasState=sd;CLOUD.seasSynced=_clone(sd);
+    CLOUD.seasSynced=_clone(sd);
+    if(_dirty.seasonal){
+      if(JSON.stringify(sd)===JSON.stringify(_seasState)){delete _dirty.seasonal;_saveDirty();}
+      else{syncPushSeasonal(_seasState);return;}
+    }
+    _seasState=sd;
     localStorage.setItem(SEAS_STORE,JSON.stringify(_seasState));
     if(typeof seasonalMode!=='undefined'&&seasonalMode)_rerender();
-  },e=>console.warn('seas listen',e));
+  });
 }
 
+function _refreshSync(){
+  if(!CLOUD.on){setSync('local');return;}
+  const u=CLOUD.auth&&CLOUD.auth.currentUser;
+  setSync(CLOUD.err?'error':(navigator.onLine?'online':'offline'),u&&u.email);
+}
+// Red banner whenever this device's changes aren't reaching the cloud.
+function _updateBanner(){
+  const b=document.getElementById('syncBanner');if(!b)return;
+  const n=_dirtyCount(),st=CLOUD.state||'local',days=n?(' '+n+' change'+(n===1?'':'s')+' waiting to sync.'):'';
+  let msg='';
+  if(st==='local')msg='⚠️ Not syncing — changes are only saved on this computer.'+days+(CLOUD.auth?' Sign in to sync.':' Check your internet connection and reload.');
+  else if(st==='error')msg='⚠️ Sync problem — changes are only saved on this computer.'+days+' Retrying… if this stays, reload or sign out and in.';
+  else if(st==='offline'&&n)msg='📴 Offline —'+days+' They will upload when you reconnect.';
+  b.textContent=msg;b.className='sync-banner'+(st==='offline'?' offline':'');b.style.display=msg?'block':'none';
+}
 function setSync(state,email){
+  CLOUD.state=state;
   const dot=document.getElementById('syncDot'),st=document.getElementById('cloudStatus'),us=document.getElementById('cloudUser');
-  const map={online:['','Synced — signed in'],offline:['offline','Offline — changes sync when reconnected'],local:['local','Local only (not signed in)']};
+  const map={online:['','Synced — signed in'],offline:['offline','Offline — changes sync when reconnected'],local:['local','Local only (not signed in)'],error:['error','Sync problem — retrying']};
   const pair=map[state]||map.local,cls=pair[0],label=pair[1];
   if(dot)dot.className='sync-dot '+cls;
   if(st){st.className='cloud-status '+cls;st.innerHTML='<span class="sync-dot '+cls+'"></span>'+label;}
   if(us)us.textContent=email?('Account: '+email):'';
+  _updateBanner();
 }
 function showLogin(){const o=document.getElementById('loginOverlay');if(o)o.style.display='flex';}
 function hideLogin(){const o=document.getElementById('loginOverlay');if(o)o.style.display='none';}
@@ -1278,17 +1372,17 @@ function hideLogin(){const o=document.getElementById('loginOverlay');if(o)o.styl
 function cloudInit(){
   if(typeof firebase==='undefined'){document.body.classList.add('local-only');setSync('local');return;}
   try{firebase.initializeApp(FB_CONFIG);}catch(e){document.body.classList.add('local-only');setSync('local');return;}
-  CLOUD.auth=firebase.auth();CLOUD.db=firebase.firestore();
+  CLOUD.auth=firebase.auth();CLOUD.db=firebase.firestore();CLOUD.state='connecting';
   CLOUD.db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
   CLOUD.auth.onAuthStateChanged(user=>{
     if(user){
       hideLogin();
       if(!CLOUD.on){CLOUD.on=true;CLOUD.synced={students:[],attendance:{}};CLOUD.seasSynced=null;cloudStart();}
-      setSync(navigator.onLine?'online':'offline',user.email);
+      _refreshSync();
     }else{CLOUD.on=false;setSync('local');showLogin();}
   });
-  window.addEventListener('online',()=>{if(CLOUD.on)setSync('online',CLOUD.auth.currentUser&&CLOUD.auth.currentUser.email);});
-  window.addEventListener('offline',()=>{if(CLOUD.on)setSync('offline',CLOUD.auth.currentUser&&CLOUD.auth.currentUser.email);});
+  window.addEventListener('online',_refreshSync);
+  window.addEventListener('offline',_refreshSync);
 }
 function doLogin(){
   const email=document.getElementById('loginEmail').value.trim(),pass=document.getElementById('loginPass').value,err=document.getElementById('loginErr');
@@ -1333,6 +1427,13 @@ document.getElementById('copyBackupBtn').addEventListener('click',()=>{
   box.select();
   if(navigator.clipboard)navigator.clipboard.writeText(box.value).then(()=>_toast('Backup copied')).catch(()=>{try{document.execCommand('copy');_toast('Backup copied');}catch(e){}});
   else{try{document.execCommand('copy');_toast('Backup copied');}catch(e){}}
+});
+document.getElementById('prevCopyBtn').addEventListener('click',()=>{
+  const list=_readLocal(PREV_STORE,[]);
+  if(!list.length){alert('No earlier copy has been saved on this device.');return;}
+  const p=list[0];
+  document.getElementById('backupBox').value=JSON.stringify({app:'oosh-attendance',v:2,exportedAt:p.at,data:p.data,seasonal:p.seasonal});
+  alert('Loaded the copy saved '+new Date(p.at).toLocaleString()+' into the box. Copy it somewhere safe; press Restore only if you want it to replace the current data.');
 });
 document.getElementById('restoreBtn').addEventListener('click',()=>{
   const txt=document.getElementById('backupBox').value.trim();if(!txt){alert('Paste a backup into the box first.');return;}
@@ -2253,7 +2354,7 @@ const SEAS_RECENT_KEY='oosh_seasonal_recent_names';
 let _seasState=_readLocal(SEAS_STORE,{days:{}});
 if(!_seasState.days)_seasState.days={};
 function seasLoad(){return _clone(_seasState);}
-function seasSave(d){_seasState=_clone(d);localStorage.setItem(SEAS_STORE,JSON.stringify(_seasState));syncPushSeasonal(_seasState);}
+function seasSave(d){if(JSON.stringify(d)!==JSON.stringify(_seasState)){_dirty.seasonal=true;_saveDirty();}_seasState=_clone(d);localStorage.setItem(SEAS_STORE,JSON.stringify(_seasState));syncPushSeasonal(_seasState);}
 function seasGetDay(data,ds){if(!data.days[ds])data.days[ds]=[];return data.days[ds];}
 function seasGetRecentNames(){try{return JSON.parse(localStorage.getItem(SEAS_RECENT_KEY))||[];}catch{return[];}}
 function seasAddRecentName(name){let r=seasGetRecentNames().filter(n=>n.toLowerCase()!==name.toLowerCase());r.unshift(name);r=r.slice(0,14);localStorage.setItem(SEAS_RECENT_KEY,JSON.stringify(r));}
@@ -2505,6 +2606,7 @@ document.getElementById('seasExportWeekBtn').addEventListener('click',()=>{
 
 render();
 cloudInit();
+document.getElementById('syncBanner').addEventListener('click',()=>document.getElementById('cloudModal').classList.add('open'));
 if('serviceWorker' in navigator && location.protocol.indexOf('http')===0){
   navigator.serviceWorker.register('sw.js').catch(()=>{});
 }
